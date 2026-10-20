@@ -63,6 +63,8 @@ function configure_designate {
 
     # API Configuration
     sudo cp $DESIGNATE_DIR/etc/designate/api-paste.ini $DESIGNATE_APIPASTE_CONF
+    sudo chown $STACK_USER:$STACK_USER $DESIGNATE_APIPASTE_CONF
+    sudo chmod 0644 $DESIGNATE_APIPASTE_CONF
     iniset $DESIGNATE_CONF service:api enabled_extensions_v2 $DESIGNATE_ENABLED_EXTENSIONS_V2
     iniset $DESIGNATE_CONF service:api enabled_extensions_admin $DESIGNATE_ENABLED_EXTENSIONS_ADMIN
     iniset $DESIGNATE_CONF service:api enable_host_header True
