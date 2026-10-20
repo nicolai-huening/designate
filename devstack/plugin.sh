@@ -96,7 +96,10 @@ function configure_designate {
 
     # Root Wrap
     sudo cp $DESIGNATE_DIR/etc/designate/rootwrap.conf $DESIGNATE_ROOTWRAP_CONF
+    sudo chmod 0644 $DESIGNATE_ROOTWRAP_CONF
+    sudo chown $STACK_USER $DESIGNATE_ROOTWRAP_CONF
     iniset $DESIGNATE_ROOTWRAP_CONF DEFAULT filters_path $DESIGNATE_DIR/etc/designate/rootwrap.d root-helper
+    
 
     # Oslo Concurrency
     iniset $DESIGNATE_CONF oslo_concurrency lock_path "$DESIGNATE_STATE_PATH"
