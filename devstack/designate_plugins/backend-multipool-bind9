@@ -190,7 +190,7 @@ function configure_designate_backend {
       priority: 1
 
   nameservers:
-    - host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST)
+    - host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST)
       port: $DESIGNATE_SERVICE_PORT_DNS
 
   targets:
@@ -198,13 +198,13 @@ function configure_designate_backend {
       description: BIND Instance
 
       masters:
-        - host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST)
+        - host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST)
           port: $DESIGNATE_SERVICE_PORT_MDNS
 
       options:
-        host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST)
+        host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST)
         port: $DESIGNATE_SERVICE_PORT_DNS
-        rndc_host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST)
+        rndc_host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST)
         rndc_port: $DESIGNATE_SERVICE_PORT_RNDC
         rndc_config_file: $BIND_CFG_DIR/rndc.conf
 
@@ -220,7 +220,7 @@ function configure_designate_backend {
       priority: 1
 
   nameservers:
-    - host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST2)
+    - host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST2)
       port: $DESIGNATE_SERVICE_PORT2_DNS
 
   targets:
@@ -228,13 +228,13 @@ function configure_designate_backend {
       description: BIND Instance 2nd pool
 
       masters:
-        - host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST2)
+        - host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST2)
           port: $DESIGNATE_SERVICE_PORT2_MDNS
 
       options:
-        host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST2)
+        host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST2)
         port: $DESIGNATE_SERVICE_PORT2_DNS
-        rndc_host: $(ipv6_unquote $DESIGNATE_SERVICE_HOST2)
+        rndc_host: $(ipv6_unquote $DESIGNATE_BACKEND_HOST2)
         rndc_port: $DESIGNATE_SERVICE_PORT2_RNDC
         rndc_config_file: $BIND2_CFG_DIR/rndc.conf
         rndc_key_file: $BIND2_CFG_DIR/rndc.key
@@ -267,7 +267,7 @@ options {
 };
 
 controls {
-    inet $(ipv6_unquote $DESIGNATE_SERVICE_HOST) port $DESIGNATE_SERVICE_PORT_RNDC allow { $(ipv6_unquote $DESIGNATE_SERVICE_HOST); } keys { "rndc-key"; };
+    inet $(ipv6_unquote $DESIGNATE_BACKEND_HOST) port $DESIGNATE_SERVICE_PORT_RNDC allow { $(ipv6_unquote $DESIGNATE_BACKEND_HOST); } keys { "rndc-key"; };
 };
 EOF
     # Configure Bind #2 instance
@@ -305,7 +305,7 @@ options {
 };
 
 controls {
-    inet $(ipv6_unquote $DESIGNATE_SERVICE_HOST2) port $DESIGNATE_SERVICE_PORT2_RNDC allow { $(ipv6_unquote $DESIGNATE_SERVICE_HOST2); } keys { "rndc-key"; };
+    inet $(ipv6_unquote $DESIGNATE_BACKEND_HOST2) port $DESIGNATE_SERVICE_PORT2_RNDC allow { $(ipv6_unquote $DESIGNATE_BACKEND_HOST2); } keys { "rndc-key"; };
 };
 
 include "$BIND2_TSIGKEY_FILE";
@@ -317,7 +317,7 @@ include "$BIND_CFG_DIR/rndc.key";
 
 options {
     default-key "rndc-key";
-    default-server $(ipv6_unquote $DESIGNATE_SERVICE_HOST);
+    default-server $(ipv6_unquote $DESIGNATE_BACKEND_HOST);
     default-port $DESIGNATE_SERVICE_PORT_RNDC;
 };
 EOF
@@ -328,7 +328,7 @@ include "$BIND2_CFG_DIR/rndc.key";
 
 options {
     default-key "rndc-key";
-    default-server $(ipv6_unquote $DESIGNATE_SERVICE_HOST);
+    default-server $(ipv6_unquote $DESIGNATE_BACKEND_HOST);
     default-port $DESIGNATE_SERVICE_PORT2_RNDC;
 };
 EOF

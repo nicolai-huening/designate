@@ -78,7 +78,7 @@ function configure_designate {
     fi
 
     # mDNS Configuration
-    iniset $DESIGNATE_CONF service:mdns listen ${DESIGNATE_SERVICE_HOST}:${DESIGNATE_SERVICE_PORT_MDNS}
+    iniset $DESIGNATE_CONF service:mdns listen ${DESIGNATE_BACKEND_HOST}:${DESIGNATE_SERVICE_PORT_MDNS}
     iniset $DESIGNATE_CONF service:mdns workers $API_WORKERS
 
     # Producer Configuration
