@@ -18,7 +18,7 @@ import sys
 from oslo_log import log as logging
 from oslo_reports import guru_meditation_report as gmr
 
-from designate.central import service as central_service
+from designate.central import service_sap as central_service
 import designate.conf
 from designate import service
 from designate import utils
@@ -33,6 +33,6 @@ def main():
     logging.setup(CONF, 'designate')
     gmr.TextGuruMeditation.setup_autorun(version)
 
-    server = central_service.Service()
+    server = central_service.ServiceSAP()
     service.serve(server, workers=CONF['service:central'].workers)
     service.wait()

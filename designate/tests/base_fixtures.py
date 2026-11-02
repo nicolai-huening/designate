@@ -93,11 +93,13 @@ class RPCFixture(fixtures.Fixture):
         if rpc.initialized():
             rpc.cleanup()
 
+_SVC_OVERRIDES = {'central': 'designate.central.service_sap.ServiceSAP'}
 
 class ServiceFixture(fixtures.Fixture):
     def __init__(self, svc_name):
-        cls = importutils.import_class(
-            'designate.%s.service.Service' % svc_name)
+        dotted = _SVC_OVERRIDES.get(
+            svc_name, 'designate.%s.service.Service' % svc_name)
+        cls = importutils.import_class(dotted);
         self.svc = cls()
         self.svc_name = svc_name
 

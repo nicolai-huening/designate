@@ -22,7 +22,6 @@ import signal
 import string
 import time
 
-from eventlet import tpool
 from dns import exception as dnsexception
 from dns import zone as dnszone
 from oslo_log import log as logging
@@ -37,7 +36,6 @@ import designate.conf
 from designate import coordination
 from designate import dnsutils
 from designate import exceptions
-from designate import heartbeat_emitter
 from designate import network_api
 from designate import objects
 from designate import policy
@@ -56,7 +54,7 @@ LOG = logging.getLogger(__name__)
 
 
 class Service(service.RPCService):
-    RPC_API_VERSION = '6.12'
+    RPC_API_VERSION = '6.10'
 
     target = messaging.Target(version=RPC_API_VERSION)
 
@@ -76,9 +74,6 @@ class Service(service.RPCService):
             self.service_name, self.tg, grouping_enabled=False
         )
         self.network_api = network_api.get_network_api(CONF.network_api)
-        self.heartbeat = heartbeat_emitter.get_heartbeat_emitter(
-            self.service_name,
-            rpc_api=self)
 
     @property
     def scheduler(self):
@@ -112,10 +107,8 @@ class Service(service.RPCService):
 
         super().start()
         self.coordination.start()
-        self.heartbeat.start()
 
     def stop(self, graceful=True):
-        self.heartbeat.stop()
         self.coordination.stop()
         super().stop(graceful)
 
@@ -342,68 +335,6 @@ class Service(service.RPCService):
 
         return subzones
 
-    def _check_zone_ownership_conflicts(self, context, zone):
-        """
-        Ensures zone.name does not collide - as an exact duplicate, a
-        subzone, or a superzone - with a zone owned by a different
-        tenant, regardless of which pool that zone lives in.
-
-        This closes the CVE-2026-71193 cross-pool bypass: the exact
-        duplicate DB constraint (name, deleted, pool_id) and the
-        _is_subzone / _is_superzone checks were all scoped to a single
-        pool, so scheduling a zone into a different pool skirted every
-        cross-tenant ownership check.
-
-        A single tenant may still own the same or an overlapping zone
-        name across multiple pools (e.g. split-horizon deployments).
-        Cross-tenant collisions are rejected unless the operator has
-        explicitly opted in via the same policies the pool-scoped
-        create_zone flow already honours (create_sub_zone_other_project
-        for subzones, create_super_zone for superzones). There is no
-        opt-in for an exact-name cross-tenant duplicate.
-        """
-        elevated = context.elevated(all_tenants=True)
-        labels = zone.name.split('.')
-
-        # Exact-name duplicate owned by another tenant, in any pool.
-        for existing in self.storage.find_zones(elevated, {'name': zone.name}):
-            if existing.tenant_id != zone.tenant_id:
-                raise exceptions.DuplicateZone(
-                    'Zone already exists, owned by a different tenant')
-
-        # This zone would be a subzone of a zone owned by another
-        # tenant, in any pool. Stop at the first (nearest) ancestor
-        # match, same as _is_subzone.
-        for i in range(1, len(labels)):
-            name = '.'.join(labels[i:])
-            ancestors = self.storage.find_zones(elevated, {'name': name})
-            if not ancestors:
-                continue
-            for ancestor in ancestors:
-                if ancestor.tenant_id != zone.tenant_id:
-                    # Honour the same policy override the pool-scoped
-                    # subzone path uses before rejecting.
-                    if not policy.check('create_sub_zone_other_project',
-                                        context, do_raise=False):
-                        raise exceptions.IllegalChildZone(
-                            'Unable to create subzone in another tenants '
-                            'zone')
-            break
-
-        # This zone would be a superzone of a zone owned by another
-        # tenant, in any pool.
-        search_term = "%%.%(name)s" % {"name": zone.name}
-        for subzone in self.storage.find_zones(
-                elevated, {'name': search_term}):
-            if subzone.tenant_id != zone.tenant_id:
-                # Honour the same policy override the pool-scoped
-                # superzone path uses before rejecting.
-                if not policy.check('create_super_zone', context,
-                                    do_raise=False):
-                    raise exceptions.IllegalParentZone(
-                        'Unable to create zone because another tenant owns '
-                        'a subzone of the zone')
-
     def _is_valid_ttl(self, context, ttl):
         if ttl is None:
             return
@@ -493,7 +424,7 @@ class Service(service.RPCService):
 
         return ns
 
-    def _add_ns(self, context, zone, ns_record, increment_serial=True):
+    def _add_ns(self, context, zone, ns_record):
         # Get NS recordset
         # If the zone doesn't have an NS recordset yet, create one
         try:
@@ -514,14 +445,10 @@ class Service(service.RPCService):
             objects.Record(data=ns_record, managed=True)
         )
 
-        # Intentional: delayed notify is tied to increment_serial so
-        # callers that skip the serial bump also skip the notification.
-        self._update_recordset_in_storage(
-            context, zone, recordset,
-            increment_serial=increment_serial,
-            set_delayed_notify=increment_serial)
+        self._update_recordset_in_storage(context, zone, recordset,
+                                          set_delayed_notify=True)
 
-    def _delete_ns(self, context, zone, ns_record, increment_serial=True):
+    def _delete_ns(self, context, zone, ns_record):
         recordset = self.find_recordset(
             context,
             criterion={
@@ -535,12 +462,8 @@ class Service(service.RPCService):
             if record.data == ns_record:
                 recordset.records.remove(record)
 
-        # Intentional: delayed notify is tied to increment_serial so
-        # callers that skip the serial bump also skip the notification.
-        self._update_recordset_in_storage(
-            context, zone, recordset,
-            increment_serial=increment_serial,
-            set_delayed_notify=increment_serial)
+        self._update_recordset_in_storage(context, zone, recordset,
+                                          set_delayed_notify=True)
 
     # Quota Enforcement Methods
     def _enforce_zone_quota(self, context, tenant_id):
@@ -585,20 +508,12 @@ class Service(service.RPCService):
         adjusted_zone_records = (
             zone_records - recordset_records + len(recordset.records))
 
-        # Only enforce quota for non-catalog zones:
-        if zone.type != constants.ZONE_CATALOG:
-            self.quota.limit_check(context, zone.tenant_id,
-                                   zone_records=adjusted_zone_records)
+        self.quota.limit_check(context, zone.tenant_id,
+                               zone_records=adjusted_zone_records)
 
-            # Ensure the records per recordset quota is OK
-            self.quota.limit_check(context, zone.tenant_id,
-                                   recordset_records=len(recordset.records))
-
-    def _generate_record_serial(self, zone, increment_serial):
-        if not increment_serial:
-            return zone.serial
-        else:
-            return zone.serial + 1
+        # Ensure the records per recordset quota is OK
+        self.quota.limit_check(context, zone.tenant_id,
+                               recordset_records=len(recordset.records))
 
     # Misc Methods
     @rpc.expected_exceptions()
@@ -810,15 +725,7 @@ class Service(service.RPCService):
     @transaction
     @lock.synchronized_zone()
     def increment_zone_serial(self, context, zone):
-        created_ts = zone.created_at.timestamp()
-        now_ts = timeutils.utcnow_ts()
-        if created_ts < zone.serial < now_ts:
-            zone.serial = self.storage.increment_serial(
-                context, zone.id, int(now_ts))
-        else:
-            zone.serial = self.storage.increment_serial(
-                context, zone.id, zone.serial + 1
-            )
+        zone.serial = self.storage.increment_serial(context, zone.id)
         self._update_soa(context, zone)
         return zone.serial
 
@@ -844,6 +751,8 @@ class Service(service.RPCService):
                 'zone_name': zone.name
             }
 
+        policy.check('create_zone', context, target)
+
         self._enforce_catalog_zone_policy(context, zone)
 
         self._is_valid_project_id(zone.tenant_id)
@@ -857,57 +766,20 @@ class Service(service.RPCService):
         # Ensure TTL is above the minimum
         self._is_valid_ttl(context, zone.ttl)
 
-        # Ensure this zone name does not collide with another tenant's
-        # zone, regardless of which pool either zone lives in
-        self._check_zone_ownership_conflicts(context, zone)
-
         # Get a pool id
         zone.pool_id = self.scheduler.schedule_zone(context, zone)
-
-        # Get Domain name to handle IAAS domains differently
-        if context.project_domain_name:
-            domain_name = context.project_domain_name.lower()
-        else:
-            domain_name = ''
 
         # Handle sub-zones appropriately
         parent_zone = self._is_subzone(
             context, zone.name, zone.pool_id)
         if parent_zone:
-            parent_zone_shared = self.find_shared_zones(
-                context.elevated(all_tenants=True),
-                criterion={
-                    "zone_id": parent_zone.id,
-                    "target_project_id": zone.tenant_id,
-                },
-                limit=1
-            )
-
-            if parent_zone.tenant_id == zone.tenant_id or parent_zone_shared:
+            if parent_zone.tenant_id == zone.tenant_id:
                 # Record the Parent Zone ID
                 zone.parent_zone_id = parent_zone.id
-
-                # Do subzone policy check instead of regular create_zone
-                if domain_name.startswith('iaas'):
-                    # Special case - IAAS Keystone Domains
-                    policy.check('create_iaas_zone', context, target)
-                else:
-                    # All other Keystone Domains apply default rule
-                    policy.check('create_sub_zone', context, target)
-
-            elif not policy.check('create_sub_zone_other_project', context,
-                                  do_raise=False):
+            else:
                 raise exceptions.IllegalChildZone('Unable to create '
                                                   'subzone in another '
                                                   'tenants zone')
-        else:
-            # If not subzone, regular policy check applies
-            if domain_name.startswith('iaas'):
-                # Special case - IAAS Keystone Domains
-                policy.check('create_iaas_zone', context, target)
-            else:
-                # All other Keystone Domains apply default rule
-                policy.check('create_zone', context, target)
 
         # Handle super-zones appropriately
         subzones = self._is_superzone(context, zone.name, zone.pool_id)
@@ -917,10 +789,7 @@ class Service(service.RPCService):
             LOG.debug("Zone '%s' is a superzone.", zone.name)
             for subzone in subzones:
                 if subzone.tenant_id != zone.tenant_id:
-                    # raise unless explicitly allowed by the policy:
-                    if not policy.check('create_super_zone', context,
-                                        do_raise=False):
-                        raise exceptions.IllegalParentZone(msg)
+                    raise exceptions.IllegalParentZone(msg)
 
         # If this succeeds, subzone parent IDs will be updated
         # after zone is created
@@ -1076,16 +945,10 @@ class Service(service.RPCService):
 
         policy.check('find_zones', context, target)
 
-        if criterion is None:
-            criterion = {}
-
-        # we forbid to look for catalog zones and hide those by default
-        if 'type' not in criterion.keys():
+        if 'admin' not in context.roles:
+            if criterion is None:
+                criterion = {}
             criterion['type'] = '!CATALOG'
-        elif criterion.get('type') == 'CATALOG':
-            if not context.is_admin:
-                msg = 'This operation is not allowed for non-admins.'
-                raise exceptions.Forbidden(msg)
 
         return self.storage.find_zones(context, criterion, marker, limit,
                                        sort_key, sort_dir)
@@ -1117,6 +980,7 @@ class Service(service.RPCService):
         self._enforce_catalog_zone_policy(context, zone)
 
         changes = zone.obj_get_changes()
+
         # Ensure immutable fields are not changed
         if 'tenant_id' in changes:
             # TODO(kiall): Moving between tenants should be allowed, but the
@@ -1127,9 +991,6 @@ class Service(service.RPCService):
 
         if 'name' in changes:
             raise exceptions.BadRequest('Renaming a zone is not allowed')
-
-        if "serial" in changes:
-            self._update_soa(context, zone)
 
         # Ensure TTL is above the minimum
         ttl = changes.get('ttl')
@@ -1210,7 +1071,7 @@ class Service(service.RPCService):
         # Prevent deletion of a zone which has child zones
         criterion = {'parent_zone_id': zone_id}
 
-        # Look through all tenants for child zones
+        # Look for child zones across all tenants with elevated context
         if self.storage.count_zones(context.elevated(all_tenants=True),
                                     criterion) > 0:
             raise exceptions.ZoneHasSubZone('Please delete any subzones '
@@ -1538,28 +1399,24 @@ class Service(service.RPCService):
         create_ns = target_ns.difference(orig_ns)
         delete_ns = orig_ns.difference(target_ns)
 
-        # Update target NS servers for the zone without triggering serial
-        # increments or delayed notifications; the pool move handles the
-        # zone update itself at the end of this method.
+        # Update target NS servers for the zone
         for ns_record in create_ns:
-            self._add_ns(elevated_context, zone, ns_record,
-                         increment_serial=False)
+            self._add_ns(elevated_context, zone, ns_record)
 
         # Then handle the ns_records to delete
         for ns_record in delete_ns:
-            self._delete_ns(elevated_context, zone, ns_record,
-                            increment_serial=False)
+            self._delete_ns(elevated_context, zone, ns_record)
+
+        zone = self._update_zone_in_storage(
+                context, zone, increment_serial=False)
 
         LOG.info("Moving zone '%(zone)s' to pool '%(pool)s'",
                  {'zone': zone.name, 'pool': target_pool_id})
         zone.pool_id = target_pool_id
-        zone = self._update_zone_in_storage(
-                context, zone, increment_serial=False)
-
         zone.refresh = self._generate_soa_refresh_interval()
-        zone.action = constants.UPDATE
-        zone.status = constants.PENDING
-        self.worker_api.update_zone(context, zone)
+        zone.action = 'CREATE'
+        zone.status = 'PENDING'
+        self.worker_api.create_zone(context, zone)
 
         return zone
 
@@ -1600,7 +1457,7 @@ class Service(service.RPCService):
                 'tenant_id': zone.tenant_id,
             }
 
-        policy.check('create_%s_recordset' % recordset.type, context, target)
+        policy.check('create_recordset', context, target)
 
         # Override the context to be all_tenants here as we have already
         # passed the RBAC check for this call and context checks in lower
@@ -1655,9 +1512,10 @@ class Service(service.RPCService):
             for record in recordset.records:
                 record.action = 'CREATE'
                 record.status = 'PENDING'
-                record.serial = self._generate_record_serial(
-                    zone, increment_serial
-                )
+                if not increment_serial:
+                    record.serial = zone.serial
+                else:
+                    record.serial = timeutils.utcnow_ts()
 
         new_recordset = self.storage.create_recordset(context, zone.id,
                                                       recordset)
@@ -1851,8 +1709,7 @@ class Service(service.RPCService):
                 'tenant_id': zone.tenant_id
             }
 
-        recordset_type = recordset.obj_get_original_value('type')
-        policy.check('update_%s_recordset' % recordset_type, context, target)
+        policy.check('update_recordset', context, target)
 
         if recordset.managed and not context.edit_managed_records:
             raise exceptions.BadRequest('Managed records may not be updated')
@@ -1882,9 +1739,10 @@ class Service(service.RPCService):
                     continue
                 record.action = 'UPDATE'
                 record.status = 'PENDING'
-                record.serial = self._generate_record_serial(
-                    zone, increment_serial
-                )
+                if not increment_serial:
+                    record.serial = zone.serial
+                else:
+                    record.serial = timeutils.utcnow_ts()
 
             # Ensure the tenant has enough zone record quotas to
             # create new records
@@ -1943,7 +1801,7 @@ class Service(service.RPCService):
                 'tenant_id': zone.tenant_id
             }
 
-        policy.check('delete_%s_recordset' % recordset.type, context, target)
+        policy.check('delete_recordset', context, target)
 
         if recordset.managed and not context.edit_managed_records:
             raise exceptions.BadRequest('Managed records may not be deleted')
@@ -2014,146 +1872,6 @@ class Service(service.RPCService):
 
         return self.storage.find_records(context, criterion, marker, limit,
                                          sort_key, sort_dir)
-
-    @rpc.expected_exceptions()
-    def find_record(self, context, criterion=None):
-        target = {'tenant_id': context.project_id}
-        policy.check('find_record', context, target)
-
-        return self.storage.find_record(context, criterion)
-
-    @rpc.expected_exceptions()
-    @notification.notify_type('dns.record.update')
-    @lock.synchronized_zone()
-    def update_record(self, context, record, increment_serial=True):
-        zone_id = record.obj_get_original_value('zone_id')
-
-        zone = self.storage.get_zone(context, zone_id)
-
-        # Don't allow updates to zones that are being deleted
-        if zone.action == 'DELETE':
-            raise exceptions.BadRequest('Can not update a deleting zone')
-
-        recordset_id = record.obj_get_original_value('recordset_id')
-        recordset = self.storage.get_recordset(context, recordset_id)
-
-        changes = record.obj_get_changes()
-
-        # Ensure immutable fields are not changed
-        if 'tenant_id' in changes:
-            raise exceptions.BadRequest('Moving a recordset between tenants '
-                                        'is not allowed')
-
-        if 'zone_id' in changes:
-            raise exceptions.BadRequest('Moving a recordset between zones '
-                                        'is not allowed')
-
-        if 'recordset_id' in changes:
-            raise exceptions.BadRequest('Moving a recordset between '
-                                        'recordsets is not allowed')
-
-        target = {
-            'zone_id': record.obj_get_original_value('zone_id'),
-            'zone_name': zone.name,
-            'zone_type': zone.type,
-            'zone_shared': zone.shared,
-            'recordset_id': record.obj_get_original_value('recordset_id'),
-            'recordset_name': recordset.name,
-            'record_id': record.obj_get_original_value('id'),
-            'tenant_id': zone.tenant_id
-        }
-
-        policy.check('update_record', context, target)
-
-        if recordset.managed and not context.edit_managed_records:
-            raise exceptions.BadRequest('Managed records may not be updated')
-
-        record, zone = self._update_record_in_storage(
-            context, zone, record, increment_serial=increment_serial)
-
-        self.zone_api.update_zone(context, zone)
-
-        return record
-
-    @transaction
-    def _update_record_in_storage(self, context, zone, record,
-                                  increment_serial=True):
-
-        if increment_serial:
-            # update the zone's status and increment the serial
-            zone = self._update_zone_in_storage(
-                context, zone, increment_serial)
-
-        record.action = 'UPDATE'
-        record.status = 'PENDING'
-        record.serial = zone.serial
-
-        # Update the record
-        record = self.storage.update_record(context, record)
-
-        return (record, zone)
-
-    @rpc.expected_exceptions()
-    @notification.notify_type('dns.record.delete')
-    @lock.synchronized_zone()
-    def delete_record(self, context, zone_id, recordset_id, record_id,
-                      increment_serial=True):
-        zone = self.storage.get_zone(context, zone_id)
-
-        # Don't allow updates to zones that are being deleted
-        if zone.action == 'DELETE':
-            raise exceptions.BadRequest('Can not update a deleting zone')
-
-        recordset = self.storage.get_recordset(context, recordset_id)
-        record = self.storage.get_record(context, record_id)
-
-        # Ensure the zone_id matches the record's zone_id
-        if zone.id != record.zone_id:
-            raise exceptions.RecordNotFound()
-
-        # Ensure the recordset_id matches the record's recordset_id
-        if recordset.id != record.recordset_id:
-            raise exceptions.RecordNotFound()
-
-        target = {
-            'zone_id': zone_id,
-            'zone_name': zone.name,
-            'zone_type': zone.type,
-            'zone_shared': zone.shared,
-            'recordset_id': recordset_id,
-            'recordset_name': recordset.name,
-            'record_id': record.id,
-            'tenant_id': zone.tenant_id
-        }
-
-        policy.check('delete_record', context, target)
-
-        if recordset.managed and not context.edit_managed_records:
-            raise exceptions.BadRequest('Managed records may not be deleted')
-
-        record, zone = self._delete_record_in_storage(
-            context, zone, record, increment_serial=increment_serial)
-
-        self.zone_api.update_zone(context, zone)
-
-        return record
-
-    @transaction
-    def _delete_record_in_storage(self, context, zone, record,
-                                  increment_serial=True):
-
-        if increment_serial:
-            # update the zone's status and increment the serial
-            zone = self._update_zone_in_storage(
-                context, zone, increment_serial)
-
-        record.action = 'DELETE'
-        record.status = 'PENDING'
-        record.serial = zone.serial
-
-        record = self.storage.update_record(context, record)
-
-        return (record, zone)
 
     @rpc.expected_exceptions()
     def count_records(self, context, criterion=None):
@@ -2633,18 +2351,11 @@ class Service(service.RPCService):
         # Verify that there is a tenant_id
         if pool.tenant_id is None:
             pool.tenant_id = context.project_id
-        if not pool.domain_id:
-            pool.domain_id = context.project_domain_id
-
-        if (not context.is_admin and
-                pool.domain_id is not None and
-                context.project_domain_id != pool.domain_id):
-            raise exceptions.Forbidden(
-                "It's not allowed to create pools in other domain"
-            )
 
         policy.check('create_pool', context)
+
         created_pool = self.storage.create_pool(context, pool)
+
         return created_pool
 
     @rpc.expected_exceptions()
@@ -2665,26 +2376,10 @@ class Service(service.RPCService):
 
     @rpc.expected_exceptions()
     def get_pool(self, context, pool_id):
-        pool = self.storage.get_pool(context, pool_id)
-        pool_shared = False
-        if (not context.is_admin and
-                context.project_domain_id and
-                pool.domain_id is not None and
-                context.project_domain_id != pool.domain_id):
-            pool_shared = self.storage.is_pool_shared_with_domain(
-                pool_id, context.project_domain_id)
-            if not pool_shared:
-                raise exceptions.SharedPoolNotFound(
-                    "Pool isn't allowed for domain %r: %r" %
-                    (context.project_domain_id, pool))
-        target = {
-            'pool_id': pool_id,
-            'pool_name': pool.name,
-            'pool_shared': pool_shared,
-            constants.RBAC_DOMAIN_ID: pool.domain_id
-        }
-        policy.check('get_pool', context, target)
-        return pool
+
+        policy.check('get_pool', context)
+
+        return self.storage.get_pool(context, pool_id)
 
     @rpc.expected_exceptions()
     @notification.notify_type('dns.pool.update')
@@ -2920,15 +2615,7 @@ class Service(service.RPCService):
         else:
             target = {'tenant_id': zone.tenant_id}
 
-        # Handle sub-zones appropriately
-        parent_zone = self._is_subzone(context, zone.name, zone.pool_id)
-
-        if parent_zone:
-            # Do subzone policy check instead of regular zone_transfer
-            policy.check('create_sub_zone_transfer_request', context, target)
-        else:
-            # If not subzone, regular policy check applies
-            policy.check('create_zone_transfer_request', context, target)
+        policy.check('create_zone_transfer_request', context, target)
 
         zone_transfer_request.key = self._transfer_key_generator()
 
@@ -3128,19 +2815,16 @@ class Service(service.RPCService):
     # Zone Import Methods
     @rpc.expected_exceptions()
     @notification.notify_type('dns.zone_import.create')
-    def create_zone_import(self, context, request_body,
-                           pool_id='', force=False):
+    def create_zone_import(self, context, request_body):
         if policy.enforce_new_defaults():
             target = {constants.RBAC_PROJECT_ID: context.project_id}
         else:
             target = {'tenant_id': context.project_id}
 
-        if force:
-            policy.check('create_force_zone_import', context, target)
-        else:
-            policy.check('create_zone_import', context, target)
+        policy.check('create_zone_import', context, target)
 
         self._is_valid_project_id(context.project_id)
+
         values = {
             'status': 'PENDING',
             'message': None,
@@ -3154,184 +2838,63 @@ class Service(service.RPCService):
                                                               zone_import)
 
         self.tg.add_thread(self._import_zone, context, created_zone_import,
-                           request_body, pool_id=pool_id, force=force)
+                           request_body)
 
         return created_zone_import
 
     @rpc.expected_exceptions()
-    def _import_zone(self, context, zone_import, request_body, pool_id='',
-                     force=False):
-
-        def _force_import(existing_rrsets, new_rrsets):
-            """
-            if record exist in new and old then update
-            if record exist in new and not in old then create
-            if record not exist in new and exist in old then delete from old
-            """
-            for rrset in existing_rrsets:
-                recordset_id = existing_rrsets[rrset].id
-                if rrset not in new_rrsets:
-                    LOG.debug(f"Deleting recordset {recordset_id}"
-                              f" for zone {zone_object.id}")
-                    self.delete_recordset(context, zone_object.id,
-                                          recordset_id)
-                if rrset in new_rrsets:
-                    new_rrsets[rrset].id = recordset_id
-                    new_rrsets[rrset].zone_id = zone_object.id
-                    new_rrsets[rrset].tenant_id = zone_object.tenant_id
-                    LOG.debug(f"Updating recordset {rrset} for zone {rrset}")
-                    self.storage.update_recordset(context, new_rrsets[rrset])
-                    new_rrsets.pop(rrset)
-            for rrset in new_rrsets:
-                if rrset not in existing_rrsets:
-                    LOG.debug(f"Creating recordset {new_rrsets[rrset]}"
-                              f" for zone {zone_object.id}")
-                    self.create_recordset(context, zone_object.id,
-                                          new_rrsets[rrset])
-
-        def _import(self, context, zone_import, request_body, pool_id=''):
-            # Dnspython needs a str instead of a unicode object
-            zone = None
-            try:
-                dnspython_zone = dnszone.from_text(
-                    request_body,
-                    # Don't relativize, or we end up with '@' record names.
-                    relativize=False,
-                    # Don't check origin, we allow missing NS records
-                    # (missing SOA records are taken care of in _create_zone).
-                    check_origin=False)
-                zone = dnsutils.from_dnspython_zone(dnspython_zone)
-                zone.type = 'PRIMARY'
-
-                # Set pool id attribute if it was specified as request header:
-                if pool_id:
-                    attr = objects.ZoneAttributeList.from_list([
-                        {"key": "pool_id",
-                         "value": pool_id}])
-
-                    # We can set attributes freely as there are no attributes
-                    # in zone import request body since it is text/dns
-                    zone.__setattr__('attributes', attr)
-
-                if policy.enforce_new_defaults():
-                    target = {constants.RBAC_PROJECT_ID: context.project_id}
-                else:
-                    target = {'tenant_id': context.project_id}
-
-                #checks = {"MX": False, "NS": False}
-                for rrset in list(zone.recordsets):
-                    if rrset.type == 'SOA':
-                        zone.recordsets.remove(rrset)
-                    # subdomain NS records should be kept
-                    elif rrset.type == 'NS' and rrset.name == zone.name:
-                        zone.recordsets.remove(rrset)
-                    #TODO: fix the check for MX and NS record types
-                    #if rrset.type in ["MX", "NS"] and not checks[rrset.type]:
-                    #    LOG.debug(f"Checking {rrset.type} policy during zone import")
-                    #    check = policy.check(f'create_{rrset.type}_recordset',
-                    #                         context, target, do_raise=False)
-                    #    if not check:
-                    #        zone_import.status = 'ERROR'
-                    #        zone_import.message = f'Failed to create Record' \
-                    #                              f' {rrset.name} - Forbidden'
-                    #        break
-                    #    else:
-                    #        checks[rrset.type] = True
-            except dnszone.UnknownOrigin:
-                zone_import.message = ('The $ORIGIN statement is required and'
-                                      ' must be the first statement in the'
-                                      ' zonefile.')
-                zone_import.status = 'ERROR'
-            except dnsexception.SyntaxError:
-                zone_import.message = 'Malformed zonefile.'
-                zone_import.status = 'ERROR'
-            except exceptions.BadRequest:
-                zone_import.message = 'An SOA record is required.'
-                zone_import.status = 'ERROR'
-            except Exception as e:
-                LOG.exception('An undefined error occurred during zone import')
-                msg = 'An undefined error occurred. %s'\
-                      % str(e)[:130]
-                zone_import.message = msg
-                zone_import.status = 'ERROR'
-
-            return zone, zone_import
-
-        # Execute the import in a real Python thread
-        zone, zone_import = tpool.execute(_import, self, context,
-            zone_import, request_body, pool_id=pool_id)
+    def _import_zone(self, context, zone_import, request_body):
+        zone = None
+        try:
+            dnspython_zone = dnszone.from_text(
+                request_body,
+                # Don't relativize, or we end up with '@' record names.
+                relativize=False,
+                # Don't check origin, we allow missing NS records
+                # (missing SOA records are taken care of in _create_zone).
+                check_origin=False)
+            zone = dnsutils.from_dnspython_zone(dnspython_zone)
+            zone.type = 'PRIMARY'
+            for rrset in list(zone.recordsets):
+                if rrset.type == 'SOA':
+                    zone.recordsets.remove(rrset)
+                # subdomain NS records should be kept
+                elif rrset.type == 'NS' and rrset.name == zone.name:
+                    zone.recordsets.remove(rrset)
+        except dnszone.UnknownOrigin:
+            zone_import.message = (
+                'The $ORIGIN statement is required and must be the first '
+                'statement in the zonefile.'
+            )
+            zone_import.status = 'ERROR'
+        except dnsexception.SyntaxError:
+            zone_import.message = 'Malformed zonefile.'
+            zone_import.status = 'ERROR'
+        except exceptions.BadRequest:
+            zone_import.message = 'An SOA record is required.'
+            zone_import.status = 'ERROR'
+        except Exception as e:
+            LOG.exception('An undefined error occurred during zone import')
+            zone_import.message = (
+                'An undefined error occurred. %s' % str(e)[:130]
+            )
+            zone_import.status = 'ERROR'
 
         # If the zone import was valid, create the zone
         if zone_import.status != 'ERROR':
-            if policy.enforce_new_defaults():
-                target = {constants.RBAC_PROJECT_ID: context.project_id}
-            else:
-                target = {'tenant_id': context.project_id}
-
             try:
-                if force:
-                    try:
-                        zone_object = self.storage.find_zone(
-                            context,
-                            {'name': zone.name}
-                        )
-                    except exceptions.ZoneNotFound:
-                        if policy.check('create_zone_import', context,
-                                        target, do_raise=False):
-                            zone = self.create_zone(context, zone)
-                        else:
-                            zone_import.status = 'ERROR'
-                            zone_import.message = 'Failed to create zone' \
-                                                  ' - Forbidden'
-                            self.update_zone_import(context.elevated(),
-                                                    zone_import)
-                            raise exceptions.Forbidden
-                    else:
-                        criterion = {'zone_id': zone_object.id}
-                        rrsets = self.storage.find_recordsets(context,
-                                                              criterion)
-                        existing_rrsets = dict()
-                        for rrset in rrsets:
-                            if rrset.type == 'SOA':
-                                continue
-                            if rrset.type == 'NS' and rrset.name == zone.name:
-                                continue
-                            existing_rrsets[
-                                f"{rrset.name}_{rrset.type}"] = rrset
-                        new_rrsets = {
-                            f"{rrset.name}_{rrset.type}": rrset for rrset
-                            in zone.recordsets
-                        }
-                        _force_import(existing_rrsets, new_rrsets)
-                        zone_import.zone_id = zone_object.id
-                else:
-                    if policy.check('create_zone_import', context,
-                                    target, do_raise=False):
-                        zone = self.create_zone(context, zone)
-                    else:
-                        zone_import.status = 'ERROR'
-                        zone_import.message = 'Failed to create zone' \
-                                              ' - Forbidden'
-                        self.update_zone_import(context.elevated(),
-                                                zone_import)
-                        raise exceptions.Forbidden
-
+                zone = self.create_zone(context, zone)
                 zone_import.status = 'COMPLETE'
                 zone_import.zone_id = zone.id
                 zone_import.message = (
                     f'{zone.name} imported'
                 )
-
             except exceptions.DuplicateZone:
                 zone_import.status = 'ERROR'
                 zone_import.message = 'Duplicate zone.'
             except exceptions.InvalidTTL as e:
                 zone_import.status = 'ERROR'
                 zone_import.message = str(e)
-            except exceptions.Forbidden:
-                zone_import.status = 'ERROR'
-                zone_import.message = 'Failed to create zone' \
-                                      ' - Forbidden'
             except exceptions.OverQuota:
                 zone_import.status = 'ERROR'
                 zone_import.message = 'Quota exceeded during zone import.'
@@ -3339,14 +2902,12 @@ class Service(service.RPCService):
                 LOG.exception(
                     'An undefined error occurred during zone import creation'
                 )
-                msg = 'An undefined error occurred. %s'\
-                      % str(e)[:130]
-                if isinstance(e.__context__, exceptions.DuplicateZone):
-                    msg = 'Duplicate zone.'
-                zone_import.message = msg
+                zone_import.message = (
+                    'An undefined error occurred. %s' % str(e)[:130]
+                )
                 zone_import.status = 'ERROR'
 
-        self.update_zone_import(context.elevated(), zone_import)
+        self.update_zone_import(context, zone_import)
 
     @notification.notify_type('dns.zone_import.update')
     def update_zone_import(self, context, zone_import):
@@ -3583,113 +3144,3 @@ class Service(service.RPCService):
         ):
             raise exceptions.Forbidden(
                 'This operation is not allowed for catalog zones.')
-
-    @rpc.expected_exceptions()
-    def delete_service_status(self, context, service_status):
-        policy.check('delete_service_status', context)
-
-        criterion = {
-            "service_name": service_status.service_name,
-            "hostname": service_status.hostname
-        }
-
-        if service_status.obj_attr_is_set('id'):
-            criterion["id"] = service_status.id
-        try:
-            db_status = self.storage.find_service_status(
-                context, criterion)
-            db_status.update(dict(service_status))
-
-            return self.storage.delete_service_status(context, db_status)
-        except exceptions.ServiceStatusNotFound:
-            LOG.warning(
-                "Deleting service status entry for %(service_name)s "
-                "at %(hostname)s",
-                {
-                    'service_name': service_status.service_name,
-                    'hostname': service_status.hostname
-                }
-            )
-
-    # Shared pools
-    @rpc.expected_exceptions()
-    @notification.notify_type('dns.pool.share')
-    @transaction
-    def share_pool(self, context, pool_id, shared_pool):
-        # Ensure that pool exists and get the pool owner
-        elevated_context = context.elevated(all_tenants=True)
-        pool = self.storage.get_pool(elevated_context, pool_id)
-        domain_id = pool.domain_id
-        if not domain_id:
-            raise exceptions.PoolWithoutDomainId(
-                f"Pool {pool_id} doesn't have domain_id "
-                f"Specify domain_id in pools.yaml.")
-        if policy.enforce_new_defaults():
-            target = {constants.RBAC_DOMAIN_ID: domain_id}
-        else:
-            target = {'domain_id': domain_id}
-
-        policy.check('share_pool', context, target)
-        shared_pool['domain_id'] = pool.domain_id
-        shared_pool['pool_id'] = pool_id
-
-        shared_pool = self.storage.share_pool(context, shared_pool)
-
-        return shared_pool
-
-    @rpc.expected_exceptions()
-    @notification.notify_type('dns.pool.unshare')
-    @transaction
-    def unshare_pool(self, context, pool_id, pool_share_id):
-        # Ensure the share exists and get the share owner
-        shared_pool = self.get_shared_pool(context, pool_id, pool_share_id)
-
-        if policy.enforce_new_defaults():
-            target = {constants.RBAC_DOMAIN_ID: shared_pool.domain_id}
-        else:
-            target = {'domain_id': shared_pool.domain_id}
-
-        policy.check('unshare_pool', context, target)
-
-        shared_pool = self.storage.unshare_pool(
-            context, pool_id, pool_share_id
-        )
-
-        return shared_pool
-
-    @rpc.expected_exceptions()
-    def find_shared_pools(self, context, criterion=None, marker=None,
-                          limit=None, sort_key=None, sort_dir=None):
-        # By default we will let any valid token through as the filter
-        # criteria below will limit the scope of the results.
-        policy.check('find_pool_shares', context)
-
-        if not context.all_tenants:
-            target_domain = (criterion or {}).get('target_domain_id')
-            if target_domain and target_domain != context.project_domain_id:
-                if policy.enforce_new_defaults():
-                    target = {constants.RBAC_DOMAIN_ID: target_domain}
-                else:
-                    target = {'domain_id': target_domain}
-                policy.check('find_domain_pool_share', context, target)
-
-        shared_pools = self.storage.find_shared_pools(
-            context, criterion, marker, limit, sort_key, sort_dir
-        )
-
-        return shared_pools
-
-    @rpc.expected_exceptions()
-    def get_shared_pool(self, context, pool_id, pool_share_id):
-        # Ensure that share exists and get the share owner
-        pool_share = self.storage.get_shared_pool(
-            context, pool_id, pool_share_id)
-
-        if policy.enforce_new_defaults():
-            target = {constants.RBAC_DOMAIN_ID: pool_share.domain_id}
-        else:
-            target = {'domain_id': pool_share.domain_id}
-
-        policy.check('get_pool_share', context, target)
-
-        return pool_share
